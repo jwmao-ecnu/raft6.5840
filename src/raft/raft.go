@@ -19,6 +19,7 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -26,6 +27,7 @@ import (
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -63,6 +65,12 @@ const (
 	HEARTBEAT = 50 * time.Millisecond
 )
 
+// type Entry struct {
+// 	Command interface{}
+// 	Term    int64
+// 	Index   int64
+// }
+
 type Raft struct {
 	mu          sync.Mutex          // Lock to protect shared access to this peer's state
 	peers       []*labrpc.ClientEnd // RPC end points of all peers
@@ -73,9 +81,16 @@ type Raft struct {
 	currentTerm int64
 	votedfor    int
 	logIndex    int64
+	log         []LogEntry
 
 	electionTime  time.Time
 	heartbeatTime time.Duration
+
+	nextIndex  []int64
+	matchIndex []int64
+
+	commitIndex int64
+	lastApplied int64
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -104,12 +119,13 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedfor)
+	e.Encode(rf.log)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -161,6 +177,7 @@ type RequestVoteReply struct {
 type LogEntry struct {
 	Command interface{}
 	Term    int64
+	Index   int64
 }
 
 type AppendEntriesArgs struct {
@@ -173,23 +190,143 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int64
-	Success bool
+	Term     int64
+	Success  bool
+	Conflict bool
+	XTerm    int64
+	XIndex   int64
+	XLen     int64
+}
+
+func (rf *Raft) leaderAppendEntries(peer int, args *AppendEntriesArgs) {
+	var reply AppendEntriesReply
+	if ok := rf.sendAppendEntries(peer, args, &reply); !ok {
+		return
+	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if reply.Term > rf.currentTerm {
+		rf.setNewTerm(reply.Term)
+		return
+	}
+
+	if reply.Term == rf.currentTerm {
+		if reply.Success {
+			match := args.PrevLogIndex + int64(len(args.Entries))
+			next := match + 1
+			rf.nextIndex[peer] = max(next, rf.nextIndex[peer])
+			rf.matchIndex[peer] = max(match, rf.matchIndex[peer])
+			DPrintf("[%v]: %v append success next %v match %v", rf.me, peer, rf.nextIndex[peer], rf.matchIndex[peer])
+
+		} else if reply.Conflict {
+			DPrintf("[%v]: Conflict from %v %#v", rf.me, peer, reply)
+			//没有存储该leader日志
+			if reply.XTerm == -1 {
+				rf.nextIndex[peer] = reply.XLen
+			} else {
+				lastLogIdxXTerm := rf.findLastLogInTerm(reply.XTerm)
+				DPrintf("[%v]: lastLogInXTerm %v", rf.me, lastLogIdxXTerm)
+				if lastLogIdxXTerm > 0 {
+					rf.nextIndex[peer] = lastLogIdxXTerm
+				} else {
+					rf.nextIndex[peer] = reply.XIndex
+				}
+			}
+
+		} else if rf.nextIndex[peer] > 1 {
+			rf.nextIndex[peer]--
+		}
+
+	}
+
+}
+
+func (rf *Raft) LeaderCommit() {
+	if rf.state != StateLeader {
+		return
+	}
+
+	for n := rf.commitIndex + 1; n <= rf.log[len(rf.log)-1].Index; n++ {
+		if rf.log[n].Term != rf.currentTerm {
+			continue
+		}
+
+		matched := 1
+
+		for peer, _ := range rf.peers {
+			if peer == rf.me {
+				continue
+			}
+
+			if rf.matchIndex[peer] >= n {
+				matched++
+			}
+
+			if matched >= len(rf.peers)/2 {
+				// rf.apply()
+				rf.commitIndex = n
+				DPrintf("[%v] leader尝试提交 index %v", rf.me, rf.commitIndex)
+				break
+			}
+		}
+	}
+}
+
+func (rf *Raft) findLastLogInTerm(x int64) int64 {
+	for i := rf.log[len(rf.log)-1].Index; i > 0; i-- {
+		term := rf.log[i].Term
+		if term == x {
+			return i
+		} else if term < x {
+			break
+		}
+	}
+	return -1
+}
+
+func (rf *Raft) appendEntries() {
+	lastLog := rf.log[len(rf.log)-1]
+
+	for peer, _ := range rf.peers {
+		nextIndex := rf.nextIndex[peer]
+		if lastLog.Index >= nextIndex {
+			prevLog := rf.log[nextIndex-1]
+			args := AppendEntriesArgs{
+				Term:         rf.currentTerm,
+				LeaderId:     rf.me,
+				PrevLogIndex: prevLog.Index,
+				PrevLogTerm:  prevLog.Term,
+				Entries:      make([]LogEntry, lastLog.Index-nextIndex+1),
+				LeaderCommit: rf.commitIndex,
+			}
+			copy(args.Entries, rf.log[nextIndex:])
+			go rf.leaderAppendEntries(peer, &args)
+
+		}
+	}
+
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	reply.Success = false
+	reply.Term = rf.currentTerm
 
 	if args.Term < rf.currentTerm {
-		reply.Success = false
-		reply.Term = rf.currentTerm
-		fmt.Printf("node %d【receive heartbeat】 from %d ret false\n", rf.me, args.LeaderId)
-	} else {
-		rf.setNewTerm(args.Term)
-
+		fmt.Printf("node %d【receive appendtries from %d ret false\n", rf.me, args.LeaderId)
+		return
 	}
 
+	if args.Term > rf.currentTerm {
+		rf.setNewTerm(args.Term)
+		return
+	}
+
+	rf.resetElectionTimeout()
+	if rf.state == StateCandidate {
+		rf.state = StateFollower
+	}
 }
 
 func (rf *Raft) setNewTerm(term int64) {
@@ -221,6 +358,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if rf.votedfor == -1 || rf.votedfor == args.CandidateId {
 		rf.votedfor = args.CandidateId
+		rf.persist()
 		reply.VoteGranted = true
 		rf.resetElectionTimeout()
 		fmt.Printf("node %d 【grant vote】 to %d \n", rf.me, args.CandidateId)
@@ -298,9 +436,20 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	index := len(rf.log) + 1
+	term, isLeader := rf.GetState()
+	if !isLeader {
+		return index, term, isLeader
+	}
+
+	log := LogEntry{
+		Command: command,
+		Index:   int64(index),
+		Term:    rf.currentTerm,
+	}
+
+	rf.log = append(rf.log, log)
+	rf.persist()
 
 	// Your code here (2B).
 
@@ -411,6 +560,9 @@ func (rf *Raft) runCandidate() {
 				// fmt.Printf("node %d【send request vote fail】to %d peers %d\n", rf.me, i, len(rf.peers))
 				return
 			}
+
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
 
 			if rf.state != StateCandidate {
 				fmt.Printf("【not candidate】return \n")
