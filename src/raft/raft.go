@@ -22,6 +22,7 @@ import (
 	"bytes"
 	"fmt"
 	"math/rand"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -67,8 +68,8 @@ const (
 
 // type Entry struct {
 // 	Command interface{}
-// 	Term    int64
-// 	Index   int64
+// 	Term    int
+// 	Index   int
 // }
 
 type Raft struct {
@@ -78,19 +79,22 @@ type Raft struct {
 	me          int                 // this peer's index into peers[]
 	dead        int32               // set by Kill()
 	state       int
-	currentTerm int64
+	currentTerm int
 	votedfor    int
-	logIndex    int64
+	logIndex    int
 	log         []LogEntry
 
 	electionTime  time.Time
 	heartbeatTime time.Duration
 
-	nextIndex  []int64
-	matchIndex []int64
+	nextIndex  []int
+	matchIndex []int
 
-	commitIndex int64
-	lastApplied int64
+	commitIndex int
+	lastApplied int
+
+	applyCond *sync.Cond
+	applyCh   chan ApplyMsg
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -160,42 +164,42 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 type RequestVoteArgs struct {
-	Term         int64
+	Term         int
 	CandidateId  int
-	LastLogterm  int64
-	LastLogIndex int64
+	LastLogterm  int
+	LastLogIndex int
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
-	Term        int64
+	Term        int
 	VoteGranted bool
 	// Your data here (2A).
 }
 
 type LogEntry struct {
 	Command interface{}
-	Term    int64
-	Index   int64
+	Term    int
+	Index   int
 }
 
 type AppendEntriesArgs struct {
-	Term         int64
+	Term         int
 	LeaderId     int
-	PrevLogIndex int64
-	PrevLogTerm  int64
+	PrevLogIndex int
+	PrevLogTerm  int
 	Entries      []LogEntry
-	LeaderCommit int64
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
-	Term     int64
+	Term     int
 	Success  bool
 	Conflict bool
-	XTerm    int64
-	XIndex   int64
-	XLen     int64
+	XTerm    int
+	XIndex   int
+	XLen     int
 }
 
 func (rf *Raft) leaderAppendEntries(peer int, args *AppendEntriesArgs) {
@@ -212,7 +216,7 @@ func (rf *Raft) leaderAppendEntries(peer int, args *AppendEntriesArgs) {
 
 	if reply.Term == rf.currentTerm {
 		if reply.Success {
-			match := args.PrevLogIndex + int64(len(args.Entries))
+			match := args.PrevLogIndex + len(args.Entries)
 			next := match + 1
 			rf.nextIndex[peer] = max(next, rf.nextIndex[peer])
 			rf.matchIndex[peer] = max(match, rf.matchIndex[peer])
@@ -236,7 +240,7 @@ func (rf *Raft) leaderAppendEntries(peer int, args *AppendEntriesArgs) {
 		} else if rf.nextIndex[peer] > 1 {
 			rf.nextIndex[peer]--
 		}
-
+		rf.LeaderCommit()
 	}
 
 }
@@ -265,6 +269,7 @@ func (rf *Raft) LeaderCommit() {
 			if matched >= len(rf.peers)/2 {
 				// rf.apply()
 				rf.commitIndex = n
+				rf.apply()
 				DPrintf("[%v] leader尝试提交 index %v", rf.me, rf.commitIndex)
 				break
 			}
@@ -272,7 +277,43 @@ func (rf *Raft) LeaderCommit() {
 	}
 }
 
-func (rf *Raft) findLastLogInTerm(x int64) int64 {
+func (rf *Raft) apply() {
+	rf.applyCond.Broadcast()
+}
+
+func (rf *Raft) applier() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	for !rf.killed() {
+		if rf.commitIndex > rf.lastApplied && rf.log[len(rf.log)-1].Index > rf.lastApplied {
+			rf.lastApplied++
+			applyMsg := ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[rf.lastApplied].Command,
+				CommandIndex: rf.lastApplied,
+			}
+			DPrintVerbose("[%v]: COMMIT %d: %v", rf.me, rf.lastApplied, rf.commits())
+			rf.mu.Unlock()
+			rf.applyCh <- applyMsg
+			rf.mu.Lock()
+		} else {
+			rf.applyCond.Wait()
+			DPrintf("[%v]: rf.applyCond.Wait()", rf.me)
+		}
+	}
+
+}
+
+func (rf *Raft) commits() string {
+	nums := []string{}
+	for i := 0; i <= rf.lastApplied; i++ {
+		nums = append(nums, fmt.Sprintf("%4d", rf.log[i].Command))
+	}
+	return fmt.Sprint(strings.Join(nums, "|"))
+}
+
+func (rf *Raft) findLastLogInTerm(x int) int {
 	for i := rf.log[len(rf.log)-1].Index; i > 0; i-- {
 		term := rf.log[i].Term
 		if term == x {
@@ -307,6 +348,7 @@ func (rf *Raft) appendEntries() {
 
 }
 
+//handle appendentries rpc
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -327,9 +369,44 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if rf.state == StateCandidate {
 		rf.state = StateFollower
 	}
+
+	//append entries rule 2
+	if rf.log[len(rf.log)-1].Index < args.PrevLogIndex {
+		reply.Conflict = true
+		reply.XIndex = -1
+		reply.Term = -1
+		reply.XLen = len(rf.log)
+		DPrintf("[%v]: Conflict XTerm %v, XIndex %v, XLen %v", rf.me, reply.XTerm, reply.XIndex, reply.XLen)
+		return
+	}
+
+	for idx, entry := range args.Entries {
+		//append entry rule 3
+		if entry.Index <= rf.log[len(rf.log)-1].Index && rf.log[entry.Index].Term != entry.Term {
+			rf.log = rf.log[:entry.Index]
+			rf.persist()
+		}
+
+		if entry.Index > rf.LastLog().Index {
+			rf.log = append(rf.log, args.Entries[idx:]...)
+			rf.persist()
+			break
+		}
+	}
+
+	//append entries rule 5
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = min(args.LeaderCommit, rf.LastLog().Index)
+		rf.apply()
+	}
+	reply.Success = true
 }
 
-func (rf *Raft) setNewTerm(term int64) {
+func (rf *Raft) LastLog() *LogEntry {
+	return &rf.log[len(rf.log)-1]
+}
+
+func (rf *Raft) setNewTerm(term int) {
 	if term > rf.currentTerm || rf.currentTerm == 0 {
 		rf.state = StateFollower
 		rf.currentTerm = term
@@ -444,7 +521,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	log := LogEntry{
 		Command: command,
-		Index:   int64(index),
+		Index:   int(index),
 		Term:    rf.currentTerm,
 	}
 
@@ -481,7 +558,7 @@ func (rf *Raft) SetState(state int) {
 	rf.state = state
 }
 
-func (rf *Raft) setCurrentTerm(term int64) {
+func (rf *Raft) setCurrentTerm(term int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.currentTerm = term
@@ -656,6 +733,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}
 	rf.resetElectionTimeout()
 	rf.heartbeatTime = HEARTBEAT
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.log = make([]LogEntry, 0)
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+
+	rf.applyCh = applyCh
+	rf.applyCond = sync.NewCond(&rf.mu)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

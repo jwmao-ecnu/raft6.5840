@@ -21,6 +21,31 @@ import (
 // (much more than the paper's range of timeouts).
 const RaftElectionTimeout = 1000 * time.Millisecond
 
+func TestChannel(t *testing.T) {
+	ch := make(chan int)
+	ch2 := ch
+
+	go func() {
+		for {
+			time.Sleep(2 * time.Second)
+			ch <- 2
+		}
+
+	}()
+
+	for {
+		select {
+		case <-ch:
+			fmt.Println("t1")
+		case <-ch2:
+			fmt.Println("t2")
+		}
+	}
+
+	time.Sleep(20)
+
+}
+
 func TestInitialElection2A(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
